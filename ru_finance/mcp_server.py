@@ -14,6 +14,7 @@ from datetime import date
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import Icon
 
 from . import bonds, cbr, moex, portfolio, rate
@@ -34,6 +35,11 @@ mcp = FastMCP(
     host=os.environ.get("MCP_HOST", "127.0.0.1"),
     port=int(os.environ.get("MCP_PORT", "8000")),
     stateless_http=True,  # без сессий — удобно за reverse-proxy для нескольких клиентов
+    # Сервер рассчитан на работу за reverse-proxy (nginx) при remote-доступе.
+    # Встроенная в SDK DNS-rebinding защита пускает только localhost-Host и режет
+    # проксированные запросы (421 Invalid Host header); доступ ограничивается на
+    # уровне прокси (TLS + секретный путь / IP-allowlist), поэтому отключаем её.
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
 )
 
 
