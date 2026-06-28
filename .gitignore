@@ -1,0 +1,23 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Секреты деплоя
+.env
+deploy/*.env
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# На всякий случай — личные данные (живут в родительской папке вне репо;
+# дублируем игнор, если их случайно скопируют внутрь репо)
+assets.md
+context.md

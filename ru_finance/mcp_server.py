@@ -1,0 +1,258 @@
+"""ru-finance MCP-сервер: инструменты для анализа портфеля поверх moex + cbrapi.
+
+Запуск локально (stdio):   python -m ru_finance.mcp_server
+Запуск как remote (HTTP):  MCP_TRANSPORT=streamable-http MCP_PORT=8000 python -m ru_finance.mcp_server
+  → эндпоинт http://MCP_HOST:MCP_PORT/mcp  (за nginx/TLS, см. deploy/).
+Все инструменты generic — конкретные бумаги передаются параметром (portfolio_* → assets).
+Документация ручек: README.md.
+"""
+from __future__ import annotations
+
+import base64
+import os
+from datetime import date
+from pathlib import Path
+
+from mcp.server.fastmcp import FastMCP
+from mcp.types import Icon
+
+from . import bonds, cbr, moex, portfolio, rate
+
+
+def _load_icons() -> list[Icon] | None:
+    """Иконка сервера (PT Serif ₽, изумруд) как data-URI. Рендерят Inspector/VS Code/Desktop."""
+    path = Path(__file__).parent / "icon.png"
+    if not path.exists():
+        return None
+    data = base64.b64encode(path.read_bytes()).decode()
+    return [Icon(src=f"data:image/png;base64,{data}", mimeType="image/png", sizes=["256x256"])]
+
+
+mcp = FastMCP(
+    "ru-finance",
+    icons=_load_icons(),
+    host=os.environ.get("MCP_HOST", "127.0.0.1"),
+    port=int(os.environ.get("MCP_PORT", "8000")),
+    stateless_http=True,  # без сессий — удобно за reverse-proxy для нескольких клиентов
+)
+
+
+# ─────────────────────────── MOEX (Московская биржа) ───────────────────────────
+@mcp.tool()
+def moex_resolve(query: str) -> dict:
+    """Определить бумагу по тикеру/ISIN/названию.
+
+    Вход: query — 'SBER', 'RU000A10C6F7', '26253', 'Сбербанк'.
+    Возврат: {secid, engine, market, board, type, shortname, isin}.
+    Нужен, когда неясно, как ISS адресует бумагу (акция/облигация/фонд/индекс).
+    """
+    return moex.resolve(query)
+
+
+@mcp.tool()
+def moex_quote(query: str) -> dict:
+    """Текущая котировка акции/фонда (нормализованная, цена с фоллбэками).
+
+    Вход: query — тикер/название. Возврат: {secid, price, change_pct, bid, ask,
+    open, low, high, value_today, vol_today, updatetime, price_field}.
+    В выходные LAST пуст → отдаётся MARKETPRICE/LCLOSEPRICE (см. price_field).
+    """
+    return moex.quote(query)
+
+
+@mcp.tool()
+def moex_bond(query: str) -> dict:
+    """Облигация: цена %, YTM, дюрация (годы и модиф.), купон, погашение, НКД.
+
+    Вход: query — номер ОФЗ ('26253') или ISIN ('RU000A10C6F7').
+    Возврат: {price_pct, ytm, duration_years, mod_duration_years, coupon_pct,
+    annual_coupon_per_bond, next_coupon, maturity, accrued_int, face_value, ...}.
+    """
+    return moex.bond(query)
+
+
+@mcp.tool()
+def moex_candles(query: str, frm: str, till: str, interval: str = "24") -> list[dict]:
+    """Свечи OHLCV за период. interval: 1,10,60(час),24(день),7(нед),31(мес),4(кв).
+
+    Вход: query, frm/till ('YYYY-MM-DD'). Возврат: список {begin,open,high,low,close,value,volume}.
+    """
+    return moex.candles(query, frm, till, interval)
+
+
+@mcp.tool()
+def moex_history(query: str, frm: str, till: str) -> list[dict]:
+    """Дневная история торгов (close/volume/value...) за интервал дат.
+
+    Вход: query, frm/till ('YYYY-MM-DD'). Для доходностей/волатильности/просадок.
+    """
+    return moex.history(query, frm, till)
+
+
+@mcp.tool()
+def moex_dividends(query: str) -> list[dict]:
+    """История дивидендов по бумаге (value, валюта, дата отсечки registryclosedate)."""
+    return moex.dividends(query)
+
+
+@mcp.tool()
+def moex_search_endpoints(pattern: str) -> list[dict]:
+    """Найти ISS-эндпоинты по подстроке пути (для доступа к данным без готовой ручки).
+
+    Вход: pattern — напр. '/candles', '/dividends', 'turnovers'.
+    Возврат: [{id, path, variables}]. id → потом в moex_query.
+    """
+    return moex.search_endpoints(pattern)
+
+
+@mcp.tool()
+def moex_query(template_id: int, vars: dict | None = None,
+               params: dict | None = None) -> dict:
+    """Generic-доступ к ЛЮБОМУ из ~252 эндпоинтов ISS по template_id.
+
+    Вход: template_id (из moex_search_endpoints), vars — переменные пути
+    (engine/market/board/security...), params — query-параметры (from/till/...).
+    Возврат: {block: [строки]}. Запасной путь, когда нет именованной ручки.
+    """
+    return moex.query(template_id, vars, params)
+
+
+# ─────────────────────────── ЦБ РФ (cbrapi) ───────────────────────────
+@mcp.tool()
+def cbr_key_rate(first_date: str | None = None, last_date: str | None = None,
+                 tail: int = 30) -> dict:
+    """Ключевая ставка ЦБ РФ (главный драйвер облигаций и рубля).
+
+    Даты опциональны ('YYYY-MM-DD'). Возврат: {latest, latest_date, series[]}.
+    """
+    return cbr.key_rate(first_date, last_date, tail)
+
+
+@mcp.tool()
+def cbr_ruonia(first_date: str | None = None, last_date: str | None = None,
+               tail: int = 30) -> dict:
+    """RUONIA overnight (% годовых) — ставка денежного рынка, рыночный ориентир ставки."""
+    return cbr.ruonia(first_date, last_date, tail)
+
+
+@mcp.tool()
+def cbr_ruonia_index(first_date: str | None = None, last_date: str | None = None,
+                     tail: int = 12) -> dict:
+    """RUONIA-индекс + срочные средние (1м/3м/6м, % годовых) — короткая кривая ставок.
+
+    Живая замена прекращённому ROISfix. AVG_* — проценты; RUONIA_INDEX — уровень индекса.
+    """
+    return cbr.ruonia_index(first_date, last_date, tail)
+
+
+@mcp.tool()
+def cbr_ibor(first_date: str | None = None, last_date: str | None = None,
+             tail: int = 12) -> dict:
+    """MIACR — фактические средневзвешенные ставки межбанка (MosPrime/MIBOR прекращены, пустые колонки убраны)."""
+    return cbr.ibor(first_date, last_date, tail)
+
+
+@mcp.tool()
+def cbr_currency(symbol: str, first_date: str, last_date: str, tail: int = 30) -> dict:
+    """Курс валюты ЦБ к рублю. symbol: 'USD','EUR','CNY'. Даты 'YYYY-MM-DD'."""
+    return cbr.currency(symbol, first_date, last_date, tail)
+
+
+@mcp.tool()
+def cbr_metals(first_date: str | None = None, last_date: str | None = None,
+               tail: int = 12) -> dict:
+    """Учётные цены ЦБ на драгметаллы (золото/серебро/платина/палладий)."""
+    return cbr.metals(first_date, last_date, tail)
+
+
+@mcp.tool()
+def cbr_reserves(first_date: str | None = None, last_date: str | None = None,
+                 tail: int = 12) -> dict:
+    """Международные (золотовалютные) резервы РФ (ЗВР)."""
+    return cbr.reserves(first_date, last_date, tail)
+
+
+# ─────────────────────────── Облигационная математика ───────────────────────────
+@mcp.tool()
+def bond_report(query: str) -> dict:
+    """Глубокий разбор облигации: текущие метрики + сценарии по ставке + реальная доходность.
+
+    Вход: query — номер ОФЗ/ISIN. Возврат: {bond, scenarios, real_return}.
+    scenarios — полный доход за год при сдвиге доходности на ±п.п. + точка безубытка.
+    real_return — доходность к погашению за вычетом разной инфляции.
+    """
+    b = moex.bond(query)
+    rep: dict = {"bond": b}
+    if b.get("maturity") and b.get("coupon_pct") and b.get("ytm"):
+        rep["scenarios"] = bonds.rate_scenarios(
+            b["maturity"], b["coupon_pct"], b["ytm"], today=str(date.today()))
+        rep["real_return"] = bonds.real_return(b["ytm"])
+    return rep
+
+
+# ─────────────────────────── Ожидания по ставке (G-кривая ОФЗ) ───────────────────────────
+@mcp.tool()
+def rate_expectations(key_rate: float | None = None) -> dict:
+    """Рыночные ожидания по ключевой ставке из G-кривой ОФЗ (КБД). Только числа.
+
+    key_rate опционален (иначе берётся из cbr_key_rate). Возврат: {as_of, key_rate,
+    ruonia, curve[], signals, note}. signals: наклон (slope_10y_1y/2y_3m), брутто-спреды
+    к ставке (включают срочную премию!), якорь short_vs_ruonia_1y, лесенка форвардов
+    (fwd_1y_in_1y/2y, fwd_3m_in_1y), inverted, машинная метка read
+    (cuts_priced|hikes_priced|flat). Интерпретацию под портфель делает агент (см. news.md).
+    """
+    return rate.rate_expectations(key_rate)
+
+
+@mcp.tool()
+def curve_yield(years: float) -> dict:
+    """Доходность G-кривой ОФЗ на произвольном сроке (% годовых) — привязка к дюрации бумаги.
+
+    Вход: years (напр. 5.9 под дюрацию ОФЗ 26253). Линейная интерполяция по узлам КБД.
+    """
+    return rate.curve_yield(years)
+
+
+# ─────────────────────────── Портфель (доменные отчёты) ───────────────────────────
+@mcp.tool()
+def portfolio_snapshot(assets: str) -> dict:
+    """Снимок портфеля: стоимость, P&L, позиции, распределение, риск по ставке
+    (дюрация портфеля), денежный поток (купоны/running yield). Главная ручка.
+
+    Вход: assets — портфель в markdown (формат см. в описании portfolio-ручек/TOOLS.md):
+    строки '- Название (ТИКЕР/ISIN): N шт. (цена_покупки ...)', '%' = облигация.
+    Сервер generic: конкретные бумаги приходят ТОЛЬКО в этом параметре.
+    """
+    return portfolio.snapshot(assets)
+
+
+@mcp.tool()
+def portfolio_rate_whatif(delta_pp: float, assets: str) -> dict:
+    """Что станет с портфелем при сдвиге доходностей облигаций на delta_pp п.п.
+
+    Вход: delta_pp (напр. -1, +2); assets — портфель в markdown (как в portfolio_snapshot).
+    Возврат: изменение стоимости (₽ и %) + разбивка по бондам.
+    """
+    return portfolio.rate_whatif(delta_pp, assets)
+
+
+@mcp.tool()
+def portfolio_income_calendar(assets: str) -> dict:
+    """Ближайшие поступления: следующий купон по каждой облигации + объявленные дивиденды.
+
+    Вход: assets — портфель в markdown (как в portfolio_snapshot).
+    """
+    return portfolio.income_calendar(assets)
+
+
+@mcp.tool()
+def portfolio_movers(assets: str) -> dict:
+    """Кто вырос/просел: дневное изменение и P&L против цены покупки (топ-3 в каждую сторону).
+
+    Вход: assets — портфель в markdown (как в portfolio_snapshot).
+    """
+    return portfolio.movers(assets)
+
+
+if __name__ == "__main__":
+    mcp.run(transport=os.environ.get("MCP_TRANSPORT", "stdio"))
