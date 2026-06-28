@@ -4,7 +4,7 @@
 Запуск как remote (HTTP):  MCP_TRANSPORT=streamable-http MCP_PORT=8000 python -m ru_finance.mcp_server
   → эндпоинт http://MCP_HOST:MCP_PORT/mcp  (за nginx/TLS, см. deploy/).
 Все инструменты generic — конкретные бумаги передаются параметром (portfolio_* → assets).
-Документация ручек: README.md.
+Документация ручек: docs/TOOLS.md. Гайд для агента: AGENTS.md.
 """
 from __future__ import annotations
 
@@ -199,7 +199,7 @@ def rate_expectations(key_rate: float | None = None) -> dict:
     ruonia, curve[], signals, note}. signals: наклон (slope_10y_1y/2y_3m), брутто-спреды
     к ставке (включают срочную премию!), якорь short_vs_ruonia_1y, лесенка форвардов
     (fwd_1y_in_1y/2y, fwd_3m_in_1y), inverted, машинная метка read
-    (cuts_priced|hikes_priced|flat). Интерпретацию под портфель делает агент (см. news.md).
+    (cuts_priced|hikes_priced|flat). Интерпретацию под портфель делает клиент/агент.
     """
     return rate.rate_expectations(key_rate)
 
